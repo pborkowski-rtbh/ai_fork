@@ -1,0 +1,45 @@
+#!/bin/bash
+# Every standard git hook name in this folder links here. Workers get this folder
+# through core.hooksPath, so nothing in the repo has to change.
+#
+# For pre-push it enforces the push rule. For every hook it then runs the repo's
+# own hook of the same name, because core.hooksPath would otherwise turn those off.
+
+name=$(basename "$0")
+input=""
+
+if [ "$name" = "pre-push" ]; then
+  input=$(cat)
+  protected="${FLEET_PROTECTED_BRANCHES:-main master}"
+  while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -z "${remote_ref:-}" ] && continue
+    for branch in $protected; do
+      if [ "$remote_ref" = "refs/heads/$branch" ]; then
+        echo "Refused by fleet policy: pushing to $branch is forbidden. Push your own branch and open a PR." >&2
+        exit 1
+      fi
+    done
+  done <<EOF
+$input
+EOF
+fi
+
+own=$(git config --local --get core.hooksPath 2>/dev/null)
+if [ -n "$own" ]; then
+  case "$own" in
+    /*) dir="$own" ;;
+    *) dir="$(git rev-parse --show-toplevel 2>/dev/null)/$own" ;;
+  esac
+else
+  dir="$(git rev-parse --git-common-dir 2>/dev/null)/hooks"
+fi
+
+if [ -x "$dir/$name" ]; then
+  if [ "$name" = "pre-push" ]; then
+    printf '%s\n' "$input" | "$dir/$name" "$@"
+    exit $?
+  fi
+  "$dir/$name" "$@"
+  exit $?
+fi
+exit 0

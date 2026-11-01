@@ -1,0 +1,14 @@
+#!/bin/bash
+# PreToolUse hook for the cleanup agent. It can only list and apply cleanup, and
+# bin/fleet clean makes every safety decision. Discarding work is never allowed.
+
+input=$(cat)
+tool=$(printf '%s' "$input" | jq -r '.tool_name // empty')
+[ "$tool" = "Bash" ] || { echo "The cleanup agent can only run bin/fleet clean." >&2; exit 2; }
+
+cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty')
+case "$cmd" in
+  "bin/fleet clean --list"|"bin/fleet clean --apply") exit 0 ;;
+esac
+echo "The cleanup agent can only run: bin/fleet clean --list, or bin/fleet clean --apply." >&2
+exit 2

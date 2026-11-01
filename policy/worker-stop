@@ -1,0 +1,110 @@
+#!/bin/bash
+# Stop hook for workers. Runs the repo's check commands in the worker's worktree,
+# sends the worker back when one fails, and saves the result to the task ledger.
+# The result therefore survives even if hq is closed.
+#
+# Environment, set by bin/fleet: FLEET_TASK_DIR, FLEET_ATTEMPT, FLEET_ATTEMPT_KIND,
+# FLEET_CHECKS_FILE, FLEET_CHECK_TIMEOUT.
+
+input=$(cat)
+
+# Subagents finishing is not the worker finishing.
+[ -n "$(printf '%s' "$input" | jq -r '.agent_id // empty')" ] && exit 0
+[ -n "${FLEET_TASK_DIR:-}" ] || exit 0
+[ -d "$FLEET_TASK_DIR" ] || exit 0
+
+attempt="${FLEET_ATTEMPT:-0}"
+kind="${FLEET_ATTEMPT_KIND:-worker}"
+dir="$FLEET_TASK_DIR/attempts"
+mkdir -p "$dir"
+result="$dir/$attempt.result.json"
+sendbacks_file="$dir/$attempt.sendbacks"
+max_sendbacks=2
+
+cwd=$(printf '%s' "$input" | jq -r '.cwd // empty')
+message=$(printf '%s' "$input" | jq -r '.last_assistant_message // empty')
+session=$(printf '%s' "$input" | jq -r '.session_id // empty')
+background=$(printf '%s' "$input" | jq -r '(.background_tasks // []) | length')
+[ -n "$cwd" ] && [ -d "$cwd" ] || cwd="$PWD"
+
+status=$(printf '%s\n' "$message" | sed -n 's/^[[:space:]*]*STATUS:[[:space:]*]*\([A-Za-z-]*\).*/\1/p' | head -1 | tr '[:upper:]' '[:lower:]')
+pr=$(printf '%s\n' "$message" | sed -n 's/^[[:space:]*]*PR:[[:space:]*]*\(https\{0,1\}:[^[:space:]]*\).*/\1/p' | head -1)
+
+save() {
+  # save <checks_state> <checks_json>
+  local branch head tmp
+  branch=$(git -C "$cwd" branch --show-current 2>/dev/null)
+  head=$(git -C "$cwd" rev-parse HEAD 2>/dev/null)
+  tmp=$(mktemp "$dir/.result.XXXXXX") || exit 0
+  jq -n --arg status "$status" --arg message "$message" --arg pr "$pr" --arg cwd "$cwd" \
+    --arg branch "$branch" --arg head "$head" --arg session "$session" --arg state "$1" \
+    --argjson checks "$2" --argjson background "${background:-0}" --argjson at "$(date +%s)" \
+    '{status:$status,message:$message,pr:$pr,cwd:$cwd,branch:$branch,head:$head,session_id:$session,
+      checks_state:$state,checks:$checks,background_tasks:$background,at:$at}' > "$tmp" && mv "$tmp" "$result"
+}
+
+# Run one command with a time limit, using nothing macOS lacks.
+run_limited() {
+  local limit="$1" log="$2" cmd="$3" pid waited=0
+  ( cd "$cwd" && exec bash -c "$cmd" ) >"$log" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$limit" ]; then
+      kill "$pid" 2>/dev/null; sleep 1; kill -9 "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      return 124
+    fi
+    sleep 1; waited=$((waited+1))
+  done
+  wait "$pid"
+}
+
+# Work is still going on in the background, so this isn't the real finish.
+if [ "${background:-0}" -gt 0 ]; then save skipped '[]'; exit 0; fi
+
+# Read-only workers, and workers that report they can't finish, have nothing to check.
+if [ "$kind" != "worker" ] || { [ -n "$status" ] && [ "$status" != "done" ]; }; then
+  save skipped '[]'; exit 0
+fi
+
+checks_file="${FLEET_CHECKS_FILE:-}"
+if [ -z "$checks_file" ] || [ ! -s "$checks_file" ]; then save none '[]'; exit 0; fi
+
+limit="${FLEET_CHECK_TIMEOUT:-600}"
+checks='[]'; state=passed; failure=""
+log=$(mktemp "$dir/.check.XXXXXX")
+while IFS= read -r cmd || [ -n "$cmd" ]; do
+  [ -z "$cmd" ] && continue
+  run_limited "$limit" "$log" "$cmd"; rc=$?
+  checks=$(printf '%s' "$checks" | jq --arg c "$cmd" --argjson r "$rc" '. + [{cmd:$c,rc:$r,timed_out:($r==124)}]')
+  if [ "$rc" = 124 ]; then
+    [ "$state" = passed ] && state=timeout
+  elif [ "$rc" != 0 ]; then
+    state=failed
+    failure="$cmd"
+    tail -n 40 "$log" > "$log.tail"
+    break
+  fi
+done < "$checks_file"
+
+if [ "$state" = failed ]; then
+  sent=$(cat "$sendbacks_file" 2>/dev/null || echo 0)
+  if [ "$sent" -lt "$max_sendbacks" ]; then
+    echo $((sent+1)) > "$sendbacks_file"
+    # Not final: the worker is about to continue, so fleet check must keep waiting.
+    save sent_back "$checks"
+    {
+      echo "The check command failed, so this isn't finished: $failure"
+      echo "Exit code: $rc. Last lines of its output:"
+      cat "$log.tail"
+      echo
+      echo "Fix the problem, commit and push, and finish again. If you can't fix it, end with STATUS: failed and explain why. Don't ask a question."
+    } >&2
+    rm -f "$log" "$log.tail"
+    exit 2
+  fi
+fi
+
+save "$state" "$checks"
+rm -f "$log" "$log.tail"
+exit 0

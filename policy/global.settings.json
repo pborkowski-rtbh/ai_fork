@@ -1,0 +1,34 @@
+{
+  "disableClaudeAiConnectors": true,
+  "permissions": {
+    "allow": [
+      "Bash(git push --force-with-lease *)",
+      "Bash(git push --force-with-lease=*)"
+    ],
+    "deny": [
+      "Bash(git push origin main)",
+      "Bash(git push origin master)",
+      "Bash(git push origin HEAD:main)",
+      "Bash(git push origin HEAD:master)",
+      "Bash(git push * origin main)",
+      "Bash(git push * origin master)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell|Monitor|mcp__.*",
+        "hooks": [
+          { "type": "command", "command": "\"__FLEET_HOME__/policy/worker-guard\"" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"__FLEET_HOME__/policy/worker-stop\"", "timeout": 900 }
+        ]
+      }
+    ]
+  }
+}

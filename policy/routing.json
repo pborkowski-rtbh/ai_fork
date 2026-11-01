@@ -1,0 +1,27 @@
+{
+  "ladder": [
+    { "rung": 1, "model": "haiku", "effort": "low" },
+    { "rung": 2, "model": "haiku", "effort": "medium" },
+    { "rung": 3, "model": "sonnet", "effort": "medium" },
+    { "rung": 4, "model": "sonnet", "effort": "high" },
+    { "rung": 5, "model": "opus", "effort": "high" },
+    { "rung": 6, "model": "opus", "effort": "xhigh" }
+  ],
+  "classes": {
+    "lookup": 1,
+    "mechanical": 2,
+    "routine": 3,
+    "substantial": 4,
+    "hard": 5
+  },
+  "bumps": { "broad": 1, "unverifiable": 1 },
+  "risky_floor": 5,
+  "max_retries": 2,
+  "review": {
+    "classes": ["hard"],
+    "flags": ["risky", "unverifiable"],
+    "min_rung": 4
+  },
+  "allowed_models": ["opus", "sonnet", "haiku"],
+  "allowed_efforts": ["low", "medium", "high", "xhigh", "max"]
+}

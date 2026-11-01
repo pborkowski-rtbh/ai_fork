@@ -1,0 +1,131 @@
+#!/bin/bash
+# PreToolUse hook for workers. Refuses merges, PR approvals, clones and attempts
+# to bypass the pre-push hook. Text that only mentions these, inside a quoted
+# argument, is allowed. Exit 2 blocks the tool call.
+#
+# The push rule itself lives in policy/git-hooks, where git knows the real
+# destination. This hook only protects that mechanism.
+
+set -f  # Tokens are split below, and a * in one must not expand to file names.
+here=$(cd -P "$(dirname "$0")" && pwd -P)
+. "$here/lib/shellscan.sh"
+
+refuse() { echo "Refused by fleet policy: $1" >&2; exit 2; }
+
+is_merge_url() {
+  case "$1" in
+    */merge|*/merge/*|*/merge\?*) case "$1" in */pulls/*|*/pull/*|*/merge_requests/*) return 0 ;; esac ;;
+    */approve|*/approvals|*/merge_requests/*/approve*) return 0 ;;
+    */pulls/*/reviews*) return 0 ;;
+  esac
+  return 1
+}
+
+check_segment() {
+  local depth="$1" IFS="$SCAN_US" t
+  # shellcheck disable=SC2086
+  set -- $2
+  IFS=$' \t\n'
+
+  # Skip variable assignments and simple wrappers, checking what they set.
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      GIT_CONFIG*=*|GIT_CONFIG_COUNT=*|GIT_DIR=*|GIT_COMMON_DIR=*) refuse "changing git's configuration in a command ($1) can bypass the push rule." ;;
+      [A-Za-z_]*=*) shift ;;
+      env|command|exec|nohup|time|sudo|xargs|builtin) shift ;;
+      -*) if [ "${prev_wrapper:-}" = 1 ]; then shift; else break; fi ;;
+      *) break ;;
+    esac
+    prev_wrapper=1
+  done
+  prev_wrapper=0
+  [ $# -eq 0 ] && return 0
+
+  local cmd="${1##*/}"; shift
+  case "$cmd" in
+    export|unset|declare|typeset)
+      for t in "$@"; do case "$t" in GIT_CONFIG*|GIT_DIR*|GIT_COMMON_DIR*) refuse "changing $t can bypass the push rule." ;; esac; done
+      ;;
+    bash|sh|zsh|dash|ksh)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -c|-lc|-ic|-cl)
+            shift
+            if [ "$depth" -lt 3 ] && [ $# -gt 0 ]; then check_text $((depth+1)) "$1"; fi
+            return 0 ;;
+        esac
+        shift
+      done
+      ;;
+    eval)
+      [ "$depth" -lt 3 ] && check_text $((depth+1)) "$*"
+      ;;
+    git)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -c) case "${2:-}" in core.hookspath*|core.hooksPath*|core.HooksPath*) refuse "overriding core.hooksPath can bypass the push rule." ;; esac; shift 2 ;;
+          -c*) case "$1" in *[Hh]ooks[Pp]ath*) refuse "overriding core.hooksPath can bypass the push rule." ;; esac; shift ;;
+          --config-env*) refuse "--config-env can bypass the push rule." ;;
+          -C|--git-dir|--work-tree|--namespace|--exec-path) shift 2 ;;
+          --git-dir=*|--work-tree=*|--namespace=*|--exec-path=*|--no-pager|--paginate|-p|--bare|--no-replace-objects|--literal-pathspecs) shift ;;
+          -*) shift ;;
+          *) break ;;
+        esac
+      done
+      [ $# -eq 0 ] && return 0
+      local sub="$1"; shift
+      case "$sub" in
+        clone) refuse "workers don't clone. Report that another repo needs registering instead." ;;
+        push) for t in "$@"; do [ "$t" = "--no-verify" ] && refuse "git push --no-verify skips the push rule."; done ;;
+        config) for t in "$@"; do case "$t" in core.hookspath|core.hooksPath|core.HooksPath) refuse "changing core.hooksPath can bypass the push rule." ;; esac; done ;;
+      esac
+      ;;
+    gh)
+      case "${1:-} ${2:-}" in
+        "pr merge") refuse "merging is a human job. Report the PR as ready instead." ;;
+        "pr review") for t in "$@"; do case "$t" in --approve|-a) refuse "workers don't approve PRs." ;; esac; done ;;
+      esac
+      if [ "${1:-}" = api ]; then for t in "$@"; do is_merge_url "$t" && refuse "merging and approving through the API is a human job."; done; fi
+      ;;
+    glab)
+      case "${1:-} ${2:-}" in
+        "mr merge") refuse "merging is a human job. Report the MR as ready instead." ;;
+        "mr approve") refuse "workers don't approve MRs." ;;
+      esac
+      if [ "${1:-}" = api ]; then for t in "$@"; do is_merge_url "$t" && refuse "merging and approving through the API is a human job."; done; fi
+      ;;
+    curl|wget|http|https)
+      for t in "$@"; do is_merge_url "$t" && refuse "merging and approving through the API is a human job."; done
+      ;;
+  esac
+  return 0
+}
+
+check_text() {
+  local depth="$1" text="$2" seg
+  local saved=()
+  scan_command "$text"
+  # Copy first, since nested scans overwrite the globals.
+  if [ "${#SCAN_SEGMENTS[@]}" -gt 0 ]; then
+    saved=("${SCAN_SEGMENTS[@]}")
+    for seg in "${saved[@]}"; do check_segment "$depth" "$seg"; done
+  fi
+}
+
+input=$(cat)
+tool=$(printf '%s' "$input" | jq -r '.tool_name // empty')
+
+case "$tool" in
+  mcp__*)
+    lower=$(printf '%s' "$tool" | tr '[:upper:]' '[:lower:]')
+    case "$lower" in
+      *merge*|*approve*) refuse "merging and approving through an MCP tool is a human job." ;;
+    esac
+    exit 0
+    ;;
+  Bash|PowerShell|Monitor)
+    cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty')
+    check_text 0 "$cmd"
+    ;;
+esac
+exit 0

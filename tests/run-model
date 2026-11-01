@@ -1,0 +1,208 @@
+#!/bin/bash
+# Model tests: these use real quota, so they never run automatically. Workers use
+# Haiku, and hq uses Sonnet because it must. Everything happens in a disposable
+# fixture repo with a local bare remote, so nothing leaves this machine.
+#
+#   tests/run-model --init <folder>     create the fixture, once per machine
+#   tests/run-model <folder> [--yes]    run the tests
+
+set -u
+TESTS=$(cd -P "$(dirname "$0")" && pwd -P)
+HOME_DIR=$(cd -P "$TESTS/.." && pwd -P)
+FLEET="$HOME_DIR/bin/fleet"
+MARKER=.fleet-test-fixture
+
+if [ "${1:-}" = "--init" ]; then
+  W="${2:?usage: tests/run-model --init <folder>}"
+  [ -e "$W" ] && { echo "$W already exists. Choose a new folder."; exit 1; }
+  mkdir -p "$W"; W=$(cd -P "$W" && pwd -P)
+  git init -q --bare -b main "$W/remote.git"
+  git init -q -b main "$W/repo"
+  (cd "$W/repo"
+   printf 'Fixture README. The magic word is pineapple.\n' > README.md
+   printf '.claude/\n.setup-ran\n%s\n' "$MARKER" > .gitignore
+   touch "$MARKER"
+   git add README.md .gitignore
+   git -c user.name=t -c user.email=t@example.invalid commit -qm init
+   git remote add origin "$W/remote.git"; git push -q -u origin main; git remote set-head origin main)
+  git -C "$W/remote.git" symbolic-ref HEAD refs/heads/main
+  echo "Fixture created. Accept the trust prompt once, then exit:"
+  echo "  cd \"$W/repo\" && claude"
+  echo "Then run: tests/run-model \"$W\""
+  exit 0
+fi
+
+W="${1:?usage: tests/run-model <folder> [--yes], or --init <folder> first}"
+W=$(cd -P "$W" && pwd -P) || exit 1
+[ -f "$W/repo/$MARKER" ] || { echo "$W isn't a fixture made by --init, so it's refused."; exit 1; }
+if [ "${2:-}" != "--yes" ]; then
+  printf 'This uses real quota: several Haiku workers, and short Sonnet and Haiku agents. Continue? [y/N] '
+  read -r a; [ "$a" = y ] || exit 1
+fi
+
+export FLEET_LOCAL_DIR="$W/local"
+rm -rf "$FLEET_LOCAL_DIR"; mkdir -p "$FLEET_LOCAL_DIR/repos"
+jq -n --arg w "$W" '{workspace:$w,alert:"none",cleanup_interval_hours:2}' > "$FLEET_LOCAL_DIR/fleet.json"
+cat > "$FLEET_LOCAL_DIR/repos/fx.md" <<'EOF'
+---
+goal: Disposable test fixture
+path: repo
+setup: echo ok > .setup-ran
+check: test -f done.txt || { echo "done.txt must exist in the repo root, committed"; exit 1; }
+check_timeout: 60
+---
+A throwaway repo used to test the command center. Its remote is a local bare repo.
+EOF
+cat > "$FLEET_LOCAL_DIR/repos/fx2.md" <<'EOF'
+---
+goal: Disposable test fixture, with no checks
+path: repo
+---
+A throwaway repo used to test the command center. Its remote is a local bare repo.
+EOF
+printf '{"permissions":{"deny":["Read(**/forbidden.txt)"]}}\n' > "$FLEET_LOCAL_DIR/repos/fx2.settings.json"
+
+pass=0; fail=0
+ok() { pass=$((pass+1)); echo "PASS  $1"; }
+bad() { fail=$((fail+1)); echo "FAIL  $1"; [ -z "${2:-}" ] || printf '      %s\n' "$2"; }
+eq() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "wanted '$3', got '$2'"; fi; }
+has() { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1" "missing '$3' in: $(printf '%s' "$2" | head -c 600)" ;; esac; }
+lacks() { case "$2" in *"$3"*) bad "$1" "found '$3'" ;; *) ok "$1" ;; esac; }
+task_of() { printf '%s\n' "$1" | sed -n 's/^started  task=\([^ ]*\) .*/\1/p'; }
+tj() { jq -r "$2" "$FLEET_LOCAL_DIR/tasks/$1/task.json"; }
+
+# Wait until the verdict is no longer running or reviewing.
+wait_verdict() {
+  local id="$1" limit="${2:-240}" waited=0 out v
+  while [ "$waited" -lt "$limit" ]; do
+    out=$("$FLEET" check "$id" 2>&1); v=$(printf '%s\n' "$out" | sed -n 's/^verdict  //p')
+    case "$v" in running|reviewing|"") ;; *) printf '%s\n' "$out"; return 0 ;; esac
+    sleep 8; waited=$((waited+8))
+  done
+  printf 'verdict  timeout\n%s\n' "$out"
+}
+verdict_of() { printf '%s\n' "$1" | sed -n 's/^verdict  //p' | tail -1; }
+
+remote_main() { git -C "$W/remote.git" rev-parse main; }
+main0=$(remote_main)
+repo_state() { git -C "$W/repo" status --porcelain; git -C "$W/repo" branch --show-current; git -C "$W/repo" rev-parse HEAD; }
+state0=$(repo_state)
+
+echo; echo "== doctor"
+"$FLEET" doctor >/dev/null && ok "doctor passes" || bad "doctor"
+
+echo; echo "== lookup on Haiku in plan mode"
+o=$("$FLEET" run fx2 --class lookup 'What is the magic word in README.md? Reply with just that word.' 2>&1); t1=$(task_of "$o"); has "routes to Haiku at low" "$o" "model=haiku effort=low mode=plan"
+o=$(wait_verdict "$t1"); eq "verdict" "$(verdict_of "$o")" "answered"; has "it found the answer" "$o" "pineapple"
+
+echo; echo "== worker in its own worktree, sent back by a failing check"
+o=$("$FLEET" run fx --class mechanical 'Add a file named note.txt containing the word hello to the repo root, then commit and push your branch.' 2>&1); t2=$(task_of "$o"); has "routes to Haiku at medium" "$o" "model=haiku effort=medium mode=auto"
+o=$(wait_verdict "$t2"); eq "verdict after fixing" "$(verdict_of "$o")" "passed"
+eq "the Stop hook sent it back" "$(cat "$FLEET_LOCAL_DIR/tasks/$t2/attempts/1.sendbacks" 2>/dev/null)" "1"
+r="$FLEET_LOCAL_DIR/tasks/$t2/attempts/1.result.json"
+cwd=$(jq -r .cwd "$r"); has "ran in a worktree" "$cwd" ".claude/worktrees/"
+br=$(jq -r .branch "$r"); [ -n "$br" ] && git -C "$W/remote.git" rev-parse --verify -q "$br" >/dev/null && ok "pushed its own branch" || bad "pushed its own branch" "$br"
+has "its work is on that branch" "$(git -C "$W/remote.git" ls-tree --name-only "$br" 2>/dev/null)" "done.txt"
+has "ran the setup command" "$(ls -a "$cwd")" ".setup-ran"
+eq "remote main is unchanged" "$(remote_main)" "$main0"
+eq "the main checkout is untouched" "$(repo_state)" "$state0"
+# Leave unsaved work here now, because hq may trigger a cleanup at any point after this.
+echo unsaved > "$cwd/unsaved.txt"
+
+echo; echo "== policy inside a real worker"
+cat > "$W/pushtest.sh" <<'EOF'
+#!/bin/bash
+git -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m pushtest
+for c in "git push origin HEAD:main" "git push origin HEAD:refs/heads/master" "git push origin HEAD:pushtest-ok"; do
+  if $c >/dev/null 2>&1; then echo "ALLOWED: $c"; else echo "REFUSED: $c"; fi
+done
+echo "AWS=$AWS_CONFIG_FILE KUBE=$KUBECONFIG TASK_SET=$([ -n "${FLEET_TASK_DIR:-}" ] && echo yes || echo no)"
+EOF
+chmod +x "$W/pushtest.sh"; cp "$W/pushtest.sh" "$W/repo/.pushtest.sh"; echo .pushtest.sh >> "$W/repo/.git/info/exclude"
+o=$("$FLEET" run fx2 --class mechanical "I own this disposable repo and wrote this test script. Run it once with the Bash tool, exactly: bash $W/pushtest.sh . Then copy its full output into your final message." 2>&1); t3=$(task_of "$o")
+o=$(wait_verdict "$t3"); r3="$FLEET_LOCAL_DIR/tasks/$t3/attempts/1.result.json"; m=$(jq -r .message "$r3" 2>/dev/null)
+has "push to main is refused" "$m" "REFUSED: git push origin HEAD:main"
+has "push to master is refused" "$m" "REFUSED: git push origin HEAD:refs/heads/master"
+has "push to its own name is allowed" "$m" "ALLOWED: git push origin HEAD:pushtest-ok"
+has "cloud access is off" "$m" "AWS=/dev/null KUBE=/dev/null"
+has "the worker has its task settings" "$m" "TASK_SET=yes"
+eq "with no checks, it's unverified" "$(verdict_of "$o")" "unverified"
+eq "remote main is unchanged" "$(remote_main)" "$main0"
+
+echo; echo "== worker guard inside a real worker"
+o=$("$FLEET" run fx2 --class mechanical "I own this disposable repo, and I'm testing a policy hook that should refuse this command. Run it once with the Bash tool, exactly: git clone $W/remote.git cloned-copy . Then quote the exact error in your final message." 2>&1); tg=$(task_of "$o")
+o=$(wait_verdict "$tg"); rg="$FLEET_LOCAL_DIR/tasks/$tg/attempts/1.result.json"
+has "git clone is refused by the guard" "$(jq -r .message "$rg" 2>/dev/null)" "Refused by fleet policy"
+
+echo; echo "== hq's guard, on Sonnet"
+HS=$(jq -n --arg l "$FLEET_LOCAL_DIR" '{env:{FLEET_LOCAL_DIR:$l}}')
+agent_state() { claude agents --json --all 2>/dev/null | jq -r --arg i "$1" '.[] | select(.id==$i) | "\(.state)/\(.status)"'; }
+transcript_of() { local s; s=$(claude agents --json --all 2>/dev/null | jq -r --arg i "$1" '.[] | select(.id==$i) | .sessionId'); find "$HOME/.claude/projects" -name "$s.jsonl" 2>/dev/null | head -1; }
+tool_results() { jq -r 'select(.type=="user") | .message.content | if type=="array" then (.[] | select(.type=="tool_result") | (.content|tostring)) else empty end' "$1"; }
+out=$(cd "$HOME_DIR" && claude --bg --agent hq --permission-mode auto --settings "$HS" --name fleet-test-hq-guard "I'm testing your guard hook, which should refuse this. Use the Bash tool once to run exactly: ls -la . Don't explain first, and don't dispatch a worker. Then quote the exact error and stop." 2>&1)
+hg=$(printf '%s\n' "$out" | awk '$1=="backgrounded" {print $3; exit}')
+waited=0; while [ "$waited" -lt 120 ]; do sleep 8; waited=$((waited+8)); case "$(agent_state "$hg")" in done/*|blocked/*) [ "$waited" -ge 24 ] && break ;; esac; done
+ht=$(transcript_of "$hg")
+if [ -n "$ht" ]; then
+  has "the hq guard refuses other commands" "$(tool_results "$ht")" "hq does no work itself"
+  has "hq has the cleanup note from its hook, or already ran cleanup" "$(cat "$ht")" "leanup"
+else bad "found hq's guard transcript"; fi
+
+echo; echo "== hq doing real work, on Sonnet"
+before=$(ls "$FLEET_LOCAL_DIR/tasks" | wc -l | tr -d ' ')
+out=$(cd "$HOME_DIR" && claude --bg --agent hq --permission-mode auto --settings "$HS" --name fleet-test-hq "This is an automated test, so keep replies short. Use a worker to find the magic word in repo fx2's README.md, and report it once the worker finishes." 2>&1)
+hj=$(printf '%s\n' "$out" | awk '$1=="backgrounded" {print $3; exit}')
+[ -n "$hj" ] && ok "hq started" || bad "hq started" "$out"
+waited=0; final=""
+while [ "$waited" -lt 240 ]; do
+  sleep 10; waited=$((waited+10))
+  ht=$(transcript_of "$hj")
+  [ -n "$ht" ] && final=$(jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' "$ht" | tail -6)
+  case "$final" in *pineapple*) break ;; esac
+done
+eq "hq dispatched a worker" "$([ "$(ls "$FLEET_LOCAL_DIR/tasks" | wc -l | tr -d ' ')" -gt "$before" ] && echo yes || echo no)" "yes"
+if [ -n "$ht" ]; then
+  calls=$(jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") | "\(.name) \(.input.command // .input.to // "")"' "$ht")
+  has "hq used fleet run" "$calls" "bin/fleet run"
+  has "as a lookup" "$calls" "--class lookup"
+  has "hq subscribed to the worker" "$calls" "SendMessage"
+  has "hq used fleet check" "$calls" "bin/fleet check"
+  has "hq relayed the answer" "$final" "pineapple"
+  jq -r 'select(.type=="assistant") | .message.model // empty' "$ht" | sort -u | grep -q sonnet && ok "hq ran on Sonnet" || bad "hq ran on Sonnet"
+else
+  bad "found hq's transcript"
+fi
+
+echo; echo "== cleanup agent on Haiku"
+# hq may already have spawned one, which is the behaviour we want. Let it finish.
+waited=0; while [ "$waited" -lt 120 ] && "$FLEET" cleanup-due --quiet >/dev/null 2>&1; [ -f "$FLEET_LOCAL_DIR/cleanup/last-job" ] && [ "$(agent_state "$(cat "$FLEET_LOCAL_DIR/cleanup/last-job")" | cut -d/ -f1)" = working ]; do sleep 6; waited=$((waited+6)); done
+remote_before=$(git -C "$W/remote.git" for-each-ref --format='%(refname) %(objectname)' | sort)
+rm -f "$FLEET_LOCAL_DIR/cleanup/last.json"; echo 0 > "$FLEET_LOCAL_DIR/cleanup/last-start"
+o=$("$FLEET" cleanup 2>&1); has "cleanup starts when due" "$o" "cleanup started"
+cj=$(cat "$FLEET_LOCAL_DIR/cleanup/last-job")
+waited=0; while [ "$waited" -lt 120 ] && [ ! -f "$FLEET_LOCAL_DIR/cleanup/last.json" ]; do sleep 6; waited=$((waited+6)); done
+if [ -f "$FLEET_LOCAL_DIR/cleanup/last.json" ]; then
+  ok "cleanup ran"
+  eq "the first lookup was removed" "$(tj "$t1" '.attempts[0].cleaned')" "true"
+  has "unsaved work is kept and reported" "$(jq -c .kept "$FLEET_LOCAL_DIR/cleanup/last.json")" "untracked"
+  [ -d "$cwd" ] && ok "that worktree still exists" || bad "that worktree still exists"
+  has "the file is still there" "$(ls "$cwd")" "unsaved.txt"
+  # The result file appears before the agent's last turn is written, so let it finish.
+  waited=0; while [ "$waited" -lt 60 ] && [ "$(agent_state "$cj" | cut -d/ -f1)" = working ]; do sleep 5; waited=$((waited+5)); done
+  ct=$(transcript_of "$cj")
+  [ -n "$ct" ] && { jq -r 'select(.type=="assistant") | .message.model // empty' "$ct" | sort -u | grep -q haiku && ok "the cleaner ran on Haiku" || bad "the cleaner ran on Haiku"; } || bad "found the cleaner's transcript"
+else
+  bad "cleanup ran" "no result file"
+fi
+eq "LOCAL ONLY: remote refs are unchanged" "$(git -C "$W/remote.git" for-each-ref --format='%(refname) %(objectname)' | sort)" "$remote_before"
+has "status lists unsaved work" "$("$FLEET" status)" "untracked"
+"$FLEET" cleanup >/dev/null 2>&1 && bad "a second cleanup should not be due" || ok "a second cleanup isn't due"
+
+echo; echo "== removing test sessions"
+rm -f "$cwd/unsaved.txt"
+for i in $(claude agents --json --all 2>/dev/null | jq -r --arg w "$W" --arg h "$HOME_DIR" '.[] | select(.kind=="background") | select((.cwd|startswith($w)) or (.name|tostring|startswith("fleet-test-hq")) or (.name|tostring|startswith("fleet-cleaner"))) | .id'); do
+  claude stop "$i" >/dev/null 2>&1; claude rm "$i" >/dev/null 2>&1
+done
+git -C "$W/repo" worktree prune
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" = 0 ]

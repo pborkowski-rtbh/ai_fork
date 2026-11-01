@@ -1,0 +1,28 @@
+#!/bin/bash
+# PreToolUse hook for hq. The only command hq may run is bin/fleet, with no shell
+# operators, redirects or expansions. Text inside single quotes can hold anything,
+# so task descriptions can use any punctuation. MCP tools are refused too.
+
+here=$(cd -P "$(dirname "$0")" && pwd -P)
+. "$here/../../policy/lib/shellscan.sh"
+
+input=$(cat)
+tool=$(printf '%s' "$input" | jq -r '.tool_name // empty')
+case "$tool" in
+  Bash) ;;
+  SendMessage|ListAgents|AskUserQuestion) exit 0 ;;
+  *) echo "hq does no work itself, so $tool is refused. Dispatch a worker with bin/fleet." >&2; exit 2 ;;
+esac
+
+cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty')
+scan_command "$cmd"
+
+if [ -n "$SCAN_UNQUOTED" ] || [ "${#SCAN_SEGMENTS[@]}" -ne 1 ]; then
+  echo "hq can only run a single bin/fleet command, with no shell operators or expansions. Put the task in single quotes." >&2
+  exit 2
+fi
+case "$cmd" in
+  bin/fleet|"bin/fleet "*) exit 0 ;;
+esac
+echo "hq does no work itself, so this was refused. Dispatch a worker with bin/fleet." >&2
+exit 2

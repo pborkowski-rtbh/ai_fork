@@ -1,0 +1,6 @@
+#!/bin/bash
+# UserPromptSubmit hook for hq. Adds a note to hq's context when a cleanup is due.
+cat >/dev/null
+here=$(cd -P "$(dirname "$0")" && pwd -P)
+"$here/../../bin/fleet" cleanup-due --quiet 2>/dev/null && echo "A cleanup is due. Run: bin/fleet cleanup"
+exit 0

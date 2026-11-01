@@ -1,0 +1,599 @@
+#!/bin/bash
+# Free tests: no model is used, and nothing leaves this machine. A stub replaces
+# claude, and git tests use real git against local bare remotes. Fixture repos are
+# created here, never real ones.
+
+set -u
+TESTS=$(cd -P "$(dirname "$0")" && pwd -P)
+HOME_DIR=$(cd -P "$TESTS/.." && pwd -P)
+FLEET="$HOME_DIR/bin/fleet"
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/fleet tests.XXXXXX")   # the space is deliberate
+trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
+export FLEET_CLAUDE="$TESTS/stubs/claude"
+export STUB_DIR="$WORK/stub"
+export FLEET_LOCAL_DIR="$WORK/local"
+mkdir -p "$STUB_DIR" "$FLEET_LOCAL_DIR/repos"
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
+
+pass=0; fail=0
+ok() { pass=$((pass+1)); }
+bad() { fail=$((fail+1)); printf 'FAIL  %s\n' "$1"; [ -z "${2:-}" ] || printf '      %s\n' "$2"; }
+section() { printf '\n== %s\n' "$1"; }
+expect_ok() { local d="$1"; shift; local o; if o=$("$@" 2>&1); then ok; else bad "$d" "$o"; fi; }
+expect_fail() { local d="$1"; shift; local o; if o=$("$@" 2>&1); then bad "$d (expected refusal)" "$o"; else ok; fi; }
+expect_has() { case "$2" in *"$3"*) ok ;; *) bad "$1" "missing '$3' in: $(printf '%s' "$2" | head -c 500)" ;; esac; }
+expect_lacks() { case "$2" in *"$3"*) bad "$1" "found '$3'" ;; *) ok ;; esac; }
+expect_eq() { if [ "$2" = "$3" ]; then ok; else bad "$1" "wanted '$3', got '$2'"; fi; }
+
+hook_input() { jq -n --arg c "$1" '{tool_name:"Bash",tool_input:{command:$c}}'; }
+hq() { hook_input "$1" | "$HOME_DIR/.claude/hooks/hq-guard" >/dev/null 2>&1; }
+guard() { hook_input "$1" | "$HOME_DIR/policy/worker-guard" >/dev/null 2>&1; }
+cleaner() { hook_input "$1" | "$HOME_DIR/.claude/hooks/cleaner-guard" >/dev/null 2>&1; }
+
+# ---------- portability ----------
+section "portability"
+if bash --version | grep -q 'version 3\.'; then echo "running under bash 3"; else echo "note: this bash is newer than 3.2, so run these on macOS too"; fi
+for f in "$FLEET" "$HOME_DIR/policy/worker-guard" "$HOME_DIR/policy/worker-stop" "$HOME_DIR/policy/git-hooks/_chain" "$HOME_DIR/.claude/hooks/hq-guard" "$HOME_DIR/.claude/hooks/cleaner-guard" "$HOME_DIR/.claude/hooks/cleanup-notice" "$HOME_DIR/policy/lib/shellscan.sh"; do
+  expect_ok "syntax: $f" bash -n "$f"
+  for pat in 'declare -A' 'readarray' 'mapfile' 'readlink -f' 'realpath' 'date -d' 'sed -i' '\$\{[A-Za-z_]*,,' '\$\{[A-Za-z_]*\^\^' '(^|[;&|[:space:]])timeout [0-9"$]'; do
+    if grep -nE "$pat" "$f" | grep -qvE '^[0-9]+:[[:space:]]*#'; then bad "$f uses non-portable: $pat"; else ok; fi
+  done
+done
+tracked=$(cd "$HOME_DIR" && git ls-files --cached --others --exclude-standard 2>/dev/null | grep -v '^tests/' | grep -v '^\.spike/')
+hits=""
+for f in $tracked; do
+  [ -f "$HOME_DIR/$f" ] || continue
+  if grep -nE '/home/[a-z]|/Users/[a-z]' "$HOME_DIR/$f" | grep -v '/Users/alice' >/dev/null; then hits="$hits $f"; fi
+done
+expect_eq "no absolute home paths in tracked files" "$hits" ""
+
+# ---------- hq guard ----------
+section "hq guard"
+for c in "bin/fleet status" "bin/fleet" "bin/fleet run x --class routine 'a; b && \$(c) | d > e'" "bin/fleet run x --class routine 'it'\\''s fine'" "bin/fleet run x --class routine 'line one
+line two'"; do
+  if hq "$c"; then ok; else bad "hq should allow: $c"; fi
+done
+for c in "cat f" "ls" "bin/fleet x; rm y" "bin/fleet x > f" "bin/fleet \"\$(c)\"" "bin/fleet x
+rm y" "bin/fleet x && rm y" "bin/fleet \`c\`" "bin/fleet \$X" "rm bin/fleet" "bin/fleetx status" "./bin/fleet status" "bin/fleet x | sh" "bin/fleet x 'unterminated"; do
+  if hq "$c"; then bad "hq should block: $c"; else ok; fi
+done
+for tool in Read Edit Write Grep Agent mcp__x__y; do
+  if jq -n --arg t "$tool" '{tool_name:$t,tool_input:{}}' | "$HOME_DIR/.claude/hooks/hq-guard" >/dev/null 2>&1; then bad "hq should block tool: $tool"; else ok; fi
+done
+for tool in SendMessage ListAgents AskUserQuestion; do
+  if jq -n --arg t "$tool" '{tool_name:$t,tool_input:{}}' | "$HOME_DIR/.claude/hooks/hq-guard" >/dev/null 2>&1; then ok; else bad "hq should allow tool: $tool"; fi
+done
+
+# ---------- cleaner guard ----------
+section "cleaner guard"
+for c in "bin/fleet clean --list" "bin/fleet clean --apply"; do if cleaner "$c"; then ok; else bad "cleaner should allow: $c"; fi; done
+for c in "git push origin --delete x" "rm -rf y" "bin/fleet run x 'y'" "bin/fleet clean --list; rm y" "bin/fleet clean --discard x" "bin/fleet clean --apply && git push" "ls"; do
+  if cleaner "$c"; then bad "cleaner should block: $c"; else ok; fi
+done
+
+# ---------- worker guard ----------
+section "worker guard"
+for c in "git push --no-verify" "git push --no-verify origin x" "cd x && git push --no-verify" "git -c core.hooksPath=x push" "git -c core.hookspath=/dev/null push origin main" "GIT_CONFIG_COUNT=0 git push" "GIT_CONFIG_KEY_0=x git push" "export GIT_CONFIG_COUNT=0" "unset GIT_CONFIG_COUNT" "git config core.hooksPath /dev/null" "env GIT_CONFIG_COUNT=0 git push" "bash -c 'git push --no-verify'" "sh -c 'gh pr merge 1'" "eval 'gh pr merge 1'" "gh pr merge 1" "gh pr merge --auto 1" "glab mr merge 1" "gh api -X PUT repos/o/r/pulls/1/merge" "cd x && gh pr merge 1" "echo \$(gh pr merge 1)" "curl -X PUT https://api.github.com/repos/o/r/pulls/1/merge" "curl -X PUT https://gitlab.com/api/v4/projects/1/merge_requests/2/merge" "gh pr review 1 --approve" "gh pr review 1 -a" "glab mr approve 1" "git clone x" "cd y && git clone x" "git -C z clone x"; do
+  if guard "$c"; then bad "worker guard should block: $c"; else ok; fi
+done
+for c in "gh pr create" "gh pr create --title 'merge fix'" "gh pr create --title 'gh pr merge 1'" "gh pr checks 1 --watch" "gh pr view 1" "glab mr create" "glab ci status" "git rebase origin/main" "git merge origin/main" "git push" "git push -u origin feature" "git push --force-with-lease origin feature" "echo 'git clone x'" "grep -r 'git push --no-verify' docs" "git commit -m 'do not use --no-verify'" "git config user.name x" "gh api repos/o/r/pulls/1" "ls *.txt"; do
+  if guard "$c"; then ok; else bad "worker guard should allow: $c"; fi
+done
+if jq -n '{tool_name:"mcp__github__merge_pull_request",tool_input:{}}' | "$HOME_DIR/policy/worker-guard" >/dev/null 2>&1; then bad "worker guard should block MCP merge"; else ok; fi
+if jq -n '{tool_name:"mcp__github__get_issue",tool_input:{}}' | "$HOME_DIR/policy/worker-guard" >/dev/null 2>&1; then ok; else bad "worker guard should allow other MCP tools"; fi
+
+# ---------- pre-push ----------
+section "pre-push, real git"
+push_env() { env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$HOME_DIR/policy/git-hooks" "$@"; }
+P="$WORK/pp"; mkdir -p "$P"
+git init -q --bare -b main "$P/remote.git"; git init -q -b main "$P/w"
+cd "$P/w"; echo a > a; git add a; git commit -qm a; git remote add origin "$P/remote.git"; git push -q -u origin main
+start=$(git -C "$P/remote.git" rev-parse main)
+git checkout -q -b feature; echo b > b; git add b; git commit -qm b
+blocked() { local d="$1"; shift; if o=$(push_env "$@" 2>&1); then bad "should block: $d" "$o"; else ok; fi; }
+allowed() { local d="$1"; shift; if o=$(push_env "$@" 2>&1); then ok; else bad "should allow: $d" "$o"; fi; }
+blocked "named main" git push origin feature:main
+blocked "HEAD:master" git push origin HEAD:master
+blocked "forced" git push origin +feature:refs/heads/main
+blocked "full ref" git push origin feature:refs/heads/main
+blocked "delete" git push origin --delete main
+BR=feature:main; blocked "variable" git push origin "$BR"
+git config alias.pm 'push origin feature:main'; blocked "alias" git pm
+printf '#!/bin/bash\ngit push origin feature:main\n' > "$P/s.sh"; chmod +x "$P/s.sh"; blocked "script" "$P/s.sh"
+allowed "own branch" git push -u origin feature
+allowed "bare on feature" git push
+allowed "main-fix" git push origin feature:main-fix
+git commit -q --amend -m b2; allowed "force-with-lease" git push --force-with-lease origin feature
+git checkout -q main; echo c > c; git add c; git commit -qm c
+blocked "bare on main" git push
+blocked "HEAD on main" git push origin HEAD
+blocked "--all when main is ahead" git push --all origin
+blocked "--mirror" git push --mirror origin
+expect_eq "remote main never moved" "$(git -C "$P/remote.git" rev-parse main)" "$start"
+git reset -q --hard origin/main; git checkout -q feature
+if o=$(push_env FLEET_PROTECTED_BRANCHES="main master develop" git push origin feature:develop 2>&1); then bad "should block a repo's protected branch"; else ok; fi
+git worktree add -q "$P/wt" -b wtb; cd "$P/wt"; echo d > d; git add d; git commit -qm d
+blocked "from a worktree to main" git push origin wtb:main
+allowed "from a worktree, own branch" git push origin wtb
+cd "$P/w"
+printf '#!/bin/bash\necho own-commit >> "%s/own.log"\n' "$P" > .git/hooks/pre-commit
+printf '#!/bin/bash\ncat > /dev/null\necho own-push >> "%s/own.log"\nexit 1\n' "$P" > .git/hooks/pre-push
+chmod +x .git/hooks/pre-commit .git/hooks/pre-push
+echo e > e; git add e; push_env git commit -qm e
+blocked "repo's own failing pre-push still stops it" git push origin feature
+expect_has "repo's own hooks ran" "$(cat "$P/own.log")" "own-commit"
+expect_has "repo's own pre-push ran" "$(cat "$P/own.log")" "own-push"
+rm .git/hooks/pre-push .git/hooks/pre-commit
+mkdir hh; printf '#!/bin/bash\nexit 1\n' > hh/pre-commit; chmod +x hh/pre-commit; git config --local core.hooksPath hh
+echo f > f; git add f
+if o=$(push_env git commit -qm f 2>&1); then bad "repo's configured core.hooksPath should still run"; else ok; fi
+git config --local --unset core.hooksPath; git reset -q --hard; rm -rf hh
+cd "$HOME_DIR"
+
+# ---------- fixture for fleet ----------
+WS="$WORK/work space"; mkdir -p "$WS"
+git init -q --bare -b main "$WORK/r.git"
+git init -q -b main "$WS/app"; (cd "$WS/app"; echo x > x; git add x; git commit -qm x; git remote add origin "$WORK/r.git"; git push -q -u origin main; git remote set-head origin main)
+mkdir -p "$WS/plain" "$WORK/outside"
+jq -n --arg w "$WS" '{workspace:$w,alert:"none",cleanup_interval_hours:2}' > "$FLEET_LOCAL_DIR/fleet.json"
+cat > "$FLEET_LOCAL_DIR/repos/app.md" <<'EOF'
+---
+goal: Test application
+path: app
+setup: echo setup-marker
+check: true
+environment: prod-one
+cloud_access: none
+---
+App restrictions marker.
+EOF
+cat > "$FLEET_LOCAL_DIR/repos/plain.md" <<'EOF'
+---
+goal: A non-git folder
+path: plain
+---
+EOF
+cat > "$FLEET_LOCAL_DIR/repos/out.md" <<'EOF'
+---
+goal: Outside
+path: ../../outside
+---
+EOF
+ln -s "$WORK/outside" "$WS/link"
+cat > "$FLEET_LOCAL_DIR/repos/lnk.md" <<'EOF'
+---
+goal: Symlink out
+path: link
+---
+EOF
+cat > "$FLEET_LOCAL_DIR/repos/min.md" <<'EOF'
+---
+goal: Has a minimum
+path: app
+min_rung: 4
+---
+EOF
+cat > "$FLEET_LOCAL_DIR/environments.md" <<'EOF'
+# Environments
+
+## prod-one
+Production. Runs the app, because reasons. ENV-ONE-MARKER
+
+## other-env
+ENV-TWO-MARKER
+EOF
+printf '{"permissions":{"deny":["Bash(rm *)"],"ask":["Bash(deploy *)"],"allow":["Bash(git push origin main)"]},"env":{"GIT_CONFIG_COUNT":"0","X_REPO":"y"},"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"repo-hook"}]}]}}\n' > "$FLEET_LOCAL_DIR/repos/app.settings.json"
+
+args_of() { cat "$STUB_DIR/launch-$1.args"; }
+last_job() { printf 'job%05d' "$(cat "$STUB_DIR/seq")"; }
+task_from() { printf '%s\n' "$1" | sed -n 's/^started  task=\([^ ]*\) .*/\1/p'; }
+tj() { jq -r "$2" "$FLEET_LOCAL_DIR/tasks/$1/task.json"; }
+set_agent() { jq --arg i "$1" "map(if .id==\$i then . + $2 else . end)" "$STUB_DIR/agents.json" > "$STUB_DIR/a.tmp" && mv "$STUB_DIR/a.tmp" "$STUB_DIR/agents.json"; }
+finish_agent() { set_agent "$1" '{state:"done",status:"idle"}'; }
+result() { # task attempt status checks_state cwd [message]
+  mkdir -p "$FLEET_LOCAL_DIR/tasks/$1/attempts"
+  jq -n --arg s "$3" --arg c "$4" --arg cwd "$5" --arg m "${6:-report}" --arg pr "${7:-}" '{status:$s,message:$m,pr:$pr,cwd:$cwd,branch:"b",head:"",checks_state:$c,checks:(if $c=="failed" then [{cmd:"t",rc:1}] else [] end),background_tasks:0,at:1}' > "$FLEET_LOCAL_DIR/tasks/$1/attempts/$2.result.json"
+}
+
+# ---------- routing ----------
+section "routing"
+route_of() { local o; o=$("$FLEET" run "$@" 2>&1) || { echo "REFUSED: $o"; return 1; }; printf '%s\n' "$o" | sed -n 's/^route    class=[^ ]* rung=\([0-9]*\) model=\([a-z]*\) effort=\([a-z]*\) mode=\([a-z]*\).*/\1 \2 \3 \4/p'; }
+expect_eq "lookup"      "$(route_of app --class lookup q)"      "1 haiku low plan"
+expect_eq "mechanical"  "$(route_of app --class mechanical t)"  "2 haiku medium auto"
+expect_eq "routine"     "$(route_of app --class routine t)"     "3 sonnet medium auto"
+expect_eq "substantial" "$(route_of app --class substantial t)" "4 sonnet high auto"
+expect_eq "hard"        "$(route_of app --class hard t)"        "5 opus high auto"
+expect_eq "one bump"    "$(route_of app --class routine --broad t)" "4 sonnet high auto"
+expect_eq "two bumps"   "$(route_of app --class routine --broad --unverifiable t)" "5 opus high auto"
+expect_eq "bumps stop at the top" "$(route_of app --class hard --broad --unverifiable t)" "6 opus xhigh auto"
+expect_eq "risky floor" "$(route_of app --class mechanical --risky t)" "5 opus high auto"
+expect_eq "risky doesn't lower" "$(route_of app --class hard --broad --unverifiable --risky t)" "6 opus xhigh auto"
+expect_eq "risky lookup is exempt" "$(route_of app --class lookup --risky q)" "1 haiku low plan"
+expect_eq "repo minimum" "$(route_of min --class mechanical t)" "4 sonnet high auto"
+expect_eq "repo minimum skips lookup" "$(route_of min --class lookup q)" "1 haiku low plan"
+expect_eq "override" "$(route_of app --class routine --model opus --effort xhigh --reason asked t)" "6 opus xhigh auto"
+expect_eq "max through override" "$(route_of app --class routine --model opus --effort max --reason asked t)" "6 opus max auto"
+expect_has "override below floor is refused" "$(route_of app --class routine --risky --model haiku --effort low --reason x t)" "REFUSED"
+expect_has "override below repo minimum is refused" "$(route_of min --class routine --model haiku --effort low --reason x t)" "REFUSED"
+expect_has "override needs a reason" "$(route_of app --class routine --model opus --effort max t)" "REFUSED"
+expect_has "other models are refused" "$(route_of app --class routine --model fable --effort high --reason x t)" "REFUSED"
+expect_has "unknown class is refused" "$(route_of app --class nonsense t)" "REFUSED"
+expect_has "mode can't be chosen" "$(route_of app --class routine --mode bypassPermissions t)" "REFUSED"
+expect_eq "every dispatch is in the ledger" "$(ls "$FLEET_LOCAL_DIR/tasks" | wc -l | tr -d ' ')" "15"
+rm -rf "$FLEET_LOCAL_DIR/tasks"; echo '[]' > "$STUB_DIR/agents.json"
+
+# ---------- dispatch ----------
+section "dispatch"
+expect_fail "unregistered repo" "$FLEET" run nope --class routine t
+expect_fail "path outside the workspace" "$FLEET" run out --class routine t
+expect_fail "symlink out of the workspace" "$FLEET" run lnk --class routine t
+expect_fail "bad name" "$FLEET" run ../x --class routine t
+expect_fail "non-git folder refuses changes" "$FLEET" run plain --class routine t
+expect_ok "non-git folder allows lookup" "$FLEET" run plain --class lookup q
+o=$("$FLEET" run app --class routine 'do the thing'); j=$(last_job); id=$(task_from "$o"); a=$(args_of "$j")
+expect_has "uses --worktree" "$a" "--worktree"
+expect_has "uses auto" "$a" "auto"
+expect_has "removes AskUserQuestion" "$a" "AskUserQuestion"
+expect_has "loads the plugin" "$a" "worker-plugin"
+expect_has "brief includes setup" "$a" "setup-marker"
+expect_has "brief includes the repo's restrictions" "$a" "App restrictions marker"
+expect_has "brief includes its environment" "$a" "ENV-ONE-MARKER"
+expect_lacks "brief leaves out other environments" "$a" "ENV-TWO-MARKER"
+expect_has "brief authorizes rebased pushes" "$a" "force-with-lease"
+expect_has "brief includes the task" "$a" "do the thing"
+s="$FLEET_LOCAL_DIR/tasks/$id/attempts/1.settings.json"
+expect_ok "settings are valid JSON" jq -e . "$s"
+expect_eq "connectors off by default" "$(jq -r .disableClaudeAiConnectors "$s")" "true"
+expect_eq "git hook env is set" "$(jq -r .env.GIT_CONFIG_KEY_0 "$s")" "core.hooksPath"
+expect_eq "a repo can't turn the hook off" "$(jq -r .env.GIT_CONFIG_COUNT "$s")" "1"
+expect_eq "hooks path is right" "$(jq -r .env.GIT_CONFIG_VALUE_0 "$s")" "$HOME_DIR/policy/git-hooks"
+expect_eq "cloud defaults to none" "$(jq -r .env.AWS_CONFIG_FILE "$s")" "/dev/null"
+expect_eq "credential variables are blanked" "$(jq -r .env.AWS_ACCESS_KEY_ID "$s")" ""
+expect_eq "kube is empty" "$(jq -r .env.KUBECONFIG "$s")" "/dev/null"
+expect_eq "repo env is kept" "$(jq -r .env.X_REPO "$s")" "y"
+expect_has "global deny rules stay" "$(jq -c .permissions.deny "$s")" "git push origin main"
+expect_has "repo deny rules merge" "$(jq -c .permissions.deny "$s")" "rm"
+expect_has "repo ask rules merge" "$(jq -c .permissions.ask "$s")" "deploy"
+expect_eq "hooks concatenate" "$(jq -r '.hooks.PreToolUse | length' "$s")" "2"
+expect_has "guard hook is present, with a real path" "$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$s")" "$HOME_DIR/policy/worker-guard"
+expect_lacks "placeholder is replaced" "$(cat "$s")" "__FLEET_HOME__"
+o=$("$FLEET" run plain --class lookup q); a=$(args_of "$(last_job)")
+expect_lacks "lookup has no worktree" "$a" "--worktree"
+expect_has "lookup uses plan" "$a" "plan"
+"$FLEET" run app --class routine --pr 12 t >/dev/null; a=$(args_of "$(last_job)")
+expect_has "--pr uses #n" "$a" "#12"
+expect_fail "--pr and --branch together" "$FLEET" run app --class routine --pr 1 --branch b t
+touch "$STUB_DIR/untrusted"; o=$("$FLEET" run app --class routine t 2>&1); rm "$STUB_DIR/untrusted"
+expect_has "untrusted folder gives the fix" "$o" "accept the prompt"
+expect_has "the fix names the folder" "$o" "work space/app"
+mv "$HOME_DIR/policy/global.settings.json" "$WORK/gs"; o=$("$FLEET" run app --class routine t 2>&1); rc=$?; mv "$WORK/gs" "$HOME_DIR/policy/global.settings.json"
+expect_eq "missing policy refuses to dispatch" "$rc" "1"
+printf '{"connectors":1}' > "$FLEET_LOCAL_DIR/repos/app.settings.json.bad"; cp "$FLEET_LOCAL_DIR/repos/app.settings.json" "$WORK/as"; echo '{bad' > "$FLEET_LOCAL_DIR/repos/app.settings.json"
+expect_fail "invalid repo settings refuse to dispatch" "$FLEET" run app --class routine t
+cp "$WORK/as" "$FLEET_LOCAL_DIR/repos/app.settings.json"; rm "$FLEET_LOCAL_DIR/repos/app.settings.json.bad"
+cat > "$FLEET_LOCAL_DIR/repos/con.md" <<'EOF'
+---
+path: app
+connectors: allow
+cloud_access: profile
+cloud_aws_profile: readonly
+---
+EOF
+o=$("$FLEET" run con --class routine t); id=$(task_from "$o"); s="$FLEET_LOCAL_DIR/tasks/$id/attempts/1.settings.json"
+expect_eq "opted-in repo keeps connectors" "$(jq -r '.disableClaudeAiConnectors // "unset"' "$s")" "unset"
+expect_eq "named profile is used" "$(jq -r .env.AWS_PROFILE "$s")" "readonly"
+expect_eq "other clouds stay empty" "$(jq -r .env.KUBECONFIG "$s")" "/dev/null"
+rm -f "$FLEET_LOCAL_DIR/repos/con.md"
+
+section "branch holding"
+rm -rf "$FLEET_LOCAL_DIR/tasks"; echo '[]' > "$STUB_DIR/agents.json"
+git -C "$WS/app" branch -q held-branch
+o=$("$FLEET" run app --class routine --branch held-branch t); id=$(task_from "$o"); j=$(last_job)
+expect_eq "--branch records its worktree" "$(tj "$id" '.attempts[0].manual_worktree != ""')" "true"
+expect_ok "--branch makes a real worktree" test -d "$(tj "$id" '.attempts[0].manual_worktree')"
+expect_fail "another active worker holds it" "$FLEET" run app --class routine --branch held-branch t2
+finish_agent "$j"
+o2=$("$FLEET" run app --class routine --pr 3 t); j2=$(last_job)
+expect_fail "another active worker holds the PR" "$FLEET" run app --class routine --pr 3 t2
+jq --arg i "$j2" 'map(select(.id != $i))' "$STUB_DIR/agents.json" > "$STUB_DIR/a.tmp" && mv "$STUB_DIR/a.tmp" "$STUB_DIR/agents.json"
+expect_ok "free once that worker crashed" "$FLEET" run app --class routine --pr 3 t2
+wt=$(tj "$id" '.attempts[0].manual_worktree'); git -C "$WS/app" worktree remove --force "$wt"
+
+# ---------- verdicts ----------
+section "verdicts"
+rm -rf "$FLEET_LOCAL_DIR/tasks"; echo '[]' > "$STUB_DIR/agents.json"
+new_task() { local o; o=$("$FLEET" run app "$@" t); task_from "$o"; }
+verdict() { "$FLEET" check "$1" 2>&1 | sed -n 's/^verdict  //p'; }
+id=$(new_task --class routine); j=$(last_job)
+expect_eq "running with no result" "$(verdict "$id")" "running"
+set_agent "$j" '{status:"waiting",waitingFor:"permission prompt",state:"blocked"}'
+expect_eq "waiting on approval" "$(verdict "$id")" "waiting"
+expect_has "gives the attach command" "$("$FLEET" check "$id")" "claude attach $j"
+set_agent "$j" '{state:"failed",status:"idle",waitingFor:null}'
+expect_eq "dead session with no result is crashed" "$(verdict "$id")" "crashed"
+result "$id" 1 done passed "$WS/app"; finish_agent "$j"
+expect_eq "checks passed" "$(verdict "$id")" "passed"
+result "$id" 1 done failed "$WS/app"
+expect_eq "claims done while a check fails" "$(verdict "$id")" "failed"
+result "$id" 1 done sent_back "$WS/app"; set_agent "$j" '{state:"working",status:"busy"}'
+expect_eq "sent back and still working isn't a failure" "$(verdict "$id")" "running"
+set_agent "$j" '{state:"done",status:"idle"}'
+expect_eq "sent back, in the gap between turns, isn't a failure" "$(verdict "$id")" "running"
+set_agent "$j" '{state:"stopped",status:null}'
+expect_eq "sent back and then died is a failure" "$(verdict "$id")" "failed"
+finish_agent "$j"
+result "$id" 1 done timeout "$WS/app"
+expect_eq "timed-out check can't pass" "$(verdict "$id")" "unverified"
+result "$id" 1 done none "$WS/app"
+expect_eq "no checks and no review" "$(verdict "$id")" "unverified"
+result "$id" 1 blocked none "$WS/app"
+expect_eq "blocked" "$(verdict "$id")" "blocked"
+result "$id" 1 unclear-task none "$WS/app"
+expect_eq "unclear-task" "$(verdict "$id")" "unclear-task"
+result "$id" 1 failed none "$WS/app"
+expect_eq "worker admits failure" "$(verdict "$id")" "failed"
+expect_has "report is labelled as a claim" "$("$FLEET" check "$id")" "own claims"
+id=$(new_task --class lookup); j=$(last_job); result "$id" 1 "" skipped "$WS/app" "the answer"; finish_agent "$j"
+expect_eq "lookup is answered" "$(verdict "$id")" "answered"
+expect_has "lookup report is shown" "$("$FLEET" check "$id")" "the answer"
+
+id=$(new_task --class routine --risky); j=$(last_job); result "$id" 1 done passed "$WS/app"; finish_agent "$j"
+expect_eq "risky starts a reviewer" "$(verdict "$id")" "reviewing"
+rv=$(last_job); a=$(args_of "$rv")
+expect_has "reviewer is read-only" "$a" "plan"
+expect_eq "reviewer runs at the worker's rung" "$(tj "$id" '.attempts[-1].rung')" "5"
+expect_eq "still reviewing" "$(verdict "$id")" "reviewing"
+expect_eq "no second reviewer" "$(tj "$id" '[.attempts[]|select(.kind=="review")]|length')" "1"
+result "$id" 2 done skipped "$WS/app" "REVIEW: fail
+because"; finish_agent "$rv"
+expect_eq "reviewer rejects" "$(verdict "$id")" "failed"
+result "$id" 2 done skipped "$WS/app" "STATUS: done
+REVIEW: pass"
+expect_eq "reviewer passes" "$(verdict "$id")" "passed"
+result "$id" 2 done skipped "$WS/app" "I am not sure"
+expect_eq "reviewer gives no clear result" "$(verdict "$id")" "unverified"
+id=$(new_task --class hard); j=$(last_job); result "$id" 1 done none "$WS/app"; finish_agent "$j"
+expect_eq "hard tasks get reviewed" "$(verdict "$id")" "reviewing"
+
+section "CI signal through a stub host CLI"
+mkdir -p "$WORK/bin"; cat > "$WORK/bin/gh" <<'EOF'
+#!/bin/bash
+case "$1 $2" in
+  "pr checks") exit "$(cat "$STUB_DIR/gh-checks" 2>/dev/null || echo 0)" ;;
+  "pr view") cat "$STUB_DIR/gh-state" 2>/dev/null || echo OPEN; exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/bin/gh"; export PATH="$WORK/bin:$PATH"
+printf -- '---\ngoal: g\npath: app\nhost_cli: gh\n---\n' > "$FLEET_LOCAL_DIR/repos/hosted.md"
+o=$("$FLEET" run hosted --class routine t); id=$(task_from "$o"); j=$(last_job); finish_agent "$j"
+result "$id" 1 done none "$WS/app" "report" "https://example.invalid/pr/1"
+echo 1 > "$STUB_DIR/gh-checks"; expect_eq "failing CI" "$(verdict "$id")" "failed"
+echo 0 > "$STUB_DIR/gh-checks"; expect_eq "passing CI" "$(verdict "$id")" "passed"
+echo 8 > "$STUB_DIR/gh-checks"; expect_eq "pending CI alone proves nothing" "$(verdict "$id")" "unverified"
+
+# ---------- retries ----------
+section "retries"
+rm -rf "$FLEET_LOCAL_DIR/tasks"; echo '[]' > "$STUB_DIR/agents.json"
+id=$(new_task --class routine); j=$(last_job); finish_agent "$j"; result "$id" 1 failed none "$WS/app"; verdict "$id" >/dev/null
+expect_ok "first retry" "$FLEET" retry "$id"
+expect_eq "moved up a rung" "$(tj "$id" '.attempts[-1].rung')" "4"
+expect_eq "counts it" "$(tj "$id" .retries)" "1"
+expect_has "next attempt gets the failure report" "$(args_of "$(last_job)")" "previous attempt"
+finish_agent "$(last_job)"; result "$id" 2 failed none "$WS/app"; verdict "$id" >/dev/null
+expect_ok "second retry" "$FLEET" retry "$id"
+finish_agent "$(last_job)"; result "$id" 3 failed none "$WS/app"; verdict "$id" >/dev/null
+expect_fail "third retry is refused" "$FLEET" retry "$id"
+id=$(new_task --class hard --broad --unverifiable); j=$(last_job); finish_agent "$j"; result "$id" 1 failed none "$WS/app"; verdict "$id" >/dev/null
+expect_fail "retry from the top rung is refused" "$FLEET" retry "$id"
+id=$(new_task --class routine); j=$(last_job); set_agent "$j" '{state:"failed",status:"idle"}'; verdict "$id" >/dev/null
+expect_ok "crash retries" "$FLEET" retry "$id"
+expect_eq "crash stays on its rung" "$(tj "$id" '.attempts[-1].rung')" "3"
+set_agent "$(last_job)" '{state:"failed",status:"idle"}'; verdict "$id" >/dev/null
+expect_fail "second crash retry is refused" "$FLEET" retry "$id"
+for v in blocked unclear-task; do
+  id=$(new_task --class routine); j=$(last_job); finish_agent "$j"; result "$id" 1 "$v" none "$WS/app"; verdict "$id" >/dev/null
+  expect_fail "$v isn't retried" "$FLEET" retry "$id"
+done
+id=$(new_task --class routine); j=$(last_job); finish_agent "$j"; result "$id" 1 done passed "$WS/app"; verdict "$id" >/dev/null
+expect_fail "passed isn't retried" "$FLEET" retry "$id"
+# A failed attempt with commits continues from its tip on a new branch.
+id=$(new_task --class routine); j=$(last_job); finish_agent "$j"
+git -C "$WS/app" worktree add -q "$WORK/old" -b old-branch; (cd "$WORK/old"; echo n > n; git add n; git commit -qm n)
+h=$(git -C "$WORK/old" rev-parse HEAD); mkdir -p "$FLEET_LOCAL_DIR/tasks/$id/attempts"
+jq -n --arg h "$h" --arg c "$WORK/old" '{status:"failed",message:"m",pr:"",cwd:$c,branch:"old-branch",head:$h,checks_state:"skipped",checks:[],background_tasks:0,at:1}' > "$FLEET_LOCAL_DIR/tasks/$id/attempts/1.result.json"; verdict "$id" >/dev/null
+expect_ok "retry from the tip while the old worktree exists" "$FLEET" retry "$id"
+nw=$(tj "$id" '.attempts[-1].manual_worktree'); expect_eq "new worktree holds the earlier commit" "$(git -C "$nw" rev-parse HEAD)" "$h"
+git -C "$WS/app" worktree remove --force "$nw"; git -C "$WS/app" worktree remove --force "$WORK/old"
+
+# ---------- follow-ups ----------
+section "follow-ups"
+rm -rf "$FLEET_LOCAL_DIR/tasks"; echo '[]' > "$STUB_DIR/agents.json"; : > "$STUB_DIR/calls.log"
+id=$(new_task --class routine); j=$(last_job)
+expect_fail "refuses a busy worker" "$FLEET" continue "$id" 'more'
+finish_agent "$j"; result "$id" 1 done passed "$WS/app"
+o=$("$FLEET" continue "$id" --class mechanical 'more please'); name=$(tj "$id" '.attempts[-1].name')
+expect_has "says to message the worker" "$o" "SendMessage to $name"
+expect_has "gives the message" "$o" "more please"
+expect_has "reminds about STATUS" "$o" "STATUS"
+expect_eq "counts the follow-up" "$(tj "$id" .followups)" "1"
+expect_eq "old result is cleared" "$(test -f "$FLEET_LOCAL_DIR/tasks/$id/attempts/1.result.json" && echo yes || echo no)" "no"
+expect_lacks "never uses --resume" "$(cat "$STUB_DIR/calls.log")" "--resume"
+expect_fail "refuses a class above its rung" "$FLEET" continue "$id" --class hard 'big'
+set_agent "$j" '{state:"stopped",status:null,pid:null}'
+expect_ok "stopped worker" "$FLEET" continue "$id" 'again'
+expect_has "restarts it with respawn" "$(cat "$STUB_DIR/calls.log")" "respawn $j"
+jq --arg i "$j" 'map(select(.id != $i))' "$STUB_DIR/agents.json" > "$STUB_DIR/a.tmp" && mv "$STUB_DIR/a.tmp" "$STUB_DIR/agents.json"
+expect_fail "gone session is refused" "$FLEET" continue "$id" 'again'
+
+# ---------- worker-stop ----------
+section "worker stop hook"
+STOP="$HOME_DIR/policy/worker-stop"; T="$WORK/stoptask"; mkdir -p "$T/attempts"
+R="$WORK/stoprepo"; git init -q -b main "$R"; (cd "$R"; echo a > a; git add a; git commit -qm a)
+stop_run() { # message [background]
+  jq -n --arg c "$R" --arg m "$1" --argjson b "${2:-0}" '{cwd:$c,last_assistant_message:$m,session_id:"s",background_tasks:(if $b>0 then [1] else [] end)}' \
+   | FLEET_TASK_DIR="$T" FLEET_ATTEMPT=1 FLEET_ATTEMPT_KIND="${KIND:-worker}" FLEET_CHECKS_FILE="$T/checks" FLEET_CHECK_TIMEOUT="${LIMIT:-5}" "$STOP" 2>"$T/err"
+}
+sr() { jq -r "$1" "$T/attempts/1.result.json"; }
+echo 'true' > "$T/checks"
+stop_run $'All good\nSTATUS: done\nPR: https://example.invalid/p/9'; expect_eq "passing check lets it stop" "$?" "0"
+expect_eq "saves the state" "$(sr .checks_state)" "passed"
+expect_eq "saves the status" "$(sr .status)" "done"
+expect_eq "saves the PR" "$(sr .pr)" "https://example.invalid/p/9"
+expect_has "saves the message" "$(sr .message)" "All good"
+expect_eq "saves the worktree" "$(sr .cwd)" "$R"
+expect_eq "saves the head" "$(sr .head)" "$(git -C "$R" rev-parse HEAD)"
+rm -f "$T"/attempts/*; printf 'echo real-failure-output; exit 3\n' > "$T/checks"
+stop_run 'STATUS: done'; expect_eq "first failure sends it back" "$?" "2"
+expect_eq "a send-back isn't a final result" "$(sr .checks_state)" "sent_back"
+expect_has "passes on real output" "$(cat "$T/err")" "real-failure-output"
+expect_has "names the failing command" "$(cat "$T/err")" "exit 3"
+expect_has "says not to ask" "$(cat "$T/err")" "Don't ask a question"
+stop_run 'STATUS: done'; expect_eq "second failure sends it back" "$?" "2"
+stop_run 'STATUS: done'; expect_eq "third failure lets it stop" "$?" "0"
+expect_eq "and records the failure" "$(sr .checks_state)" "failed"
+rm -f "$T"/attempts/*; printf 'python3 -c "import time; time.sleep(30)" || sleep 30\n' > "$T/checks"
+s=$(date +%s); LIMIT=2 stop_run 'STATUS: done'; rc=$?; e=$(( $(date +%s) - s ))
+expect_eq "timeout doesn't send it back" "$rc" "0"
+expect_eq "timeout is recorded" "$(sr .checks_state)" "timeout"
+if [ "$e" -lt 15 ]; then ok; else bad "timeout took too long: ${e}s"; fi
+rm -f "$T"/attempts/*; echo 'exit 1' > "$T/checks"
+KIND=lookup stop_run 'an answer'; expect_eq "lookup skips checks" "$?" "0"; expect_eq "lookup state" "$(sr .checks_state)" "skipped"
+stop_run $'I could not do it\nSTATUS: blocked'; expect_eq "blocked worker isn't sent back" "$?" "0"; expect_eq "blocked status" "$(sr .status)" "blocked"
+stop_run $'**STATUS: failed**'; expect_eq "bold status parses" "$(sr .status)" "failed"
+: > "$T/checks"; stop_run 'STATUS: done'; expect_eq "no checks" "$(sr .checks_state)" "none"
+echo 'exit 1' > "$T/checks"; stop_run 'STATUS: done' 1; expect_eq "background work skips checks" "$?" "0"; expect_eq "background recorded" "$(sr .background_tasks)" "1"
+rm -f "$T"/attempts/*; if jq -n '{agent_id:"sub",cwd:"/",last_assistant_message:"x"}' | FLEET_TASK_DIR="$T" FLEET_ATTEMPT=1 "$STOP"; then [ -f "$T/attempts/1.result.json" ] && bad "subagent finish should be ignored" || ok; else bad "subagent finish should exit 0"; fi
+
+# ---------- cleanup ----------
+section "cleanup timing"
+rm -rf "$FLEET_LOCAL_DIR/tasks" "$FLEET_LOCAL_DIR/cleanup"; echo '[]' > "$STUB_DIR/agents.json"
+expect_ok "due when it has never run" "$FLEET" cleanup-due --quiet
+expect_has "fleet commands show the notice" "$("$FLEET" status)" "cleanup is due"
+expect_has "the hook tells hq" "$(echo '{}' | "$HOME_DIR/.claude/hooks/cleanup-notice")" "cleanup is due"
+o=$("$FLEET" cleanup); cj=$(last_job); expect_has "starts the agent" "$(args_of "$cj")" "cleaner"
+expect_fail "not due again right away" "$FLEET" cleanup
+expect_fail "not due while it runs" "$FLEET" cleanup-due --quiet
+expect_eq "the hook stays quiet" "$(echo '{}' | "$HOME_DIR/.claude/hooks/cleanup-notice")" ""
+echo $(( $(date +%s) - 7300 )) > "$FLEET_LOCAL_DIR/cleanup/last-start"
+expect_fail "not due over 2h later while one is still active" "$FLEET" cleanup-due --quiet
+finish_agent "$cj"; expect_ok "due after 2 hours" "$FLEET" cleanup-due --quiet
+echo $(( $(date +%s) - 7100 )) > "$FLEET_LOCAL_DIR/cleanup/last-start"; expect_fail "not due at just under 2 hours" "$FLEET" cleanup-due --quiet
+echo $(( $(date +%s) - 7300 )) > "$FLEET_LOCAL_DIR/cleanup/last-start"; jq --arg i "$cj" 'map(select(.id != $i))' "$STUB_DIR/agents.json" > "$STUB_DIR/a.tmp" && mv "$STUB_DIR/a.tmp" "$STUB_DIR/agents.json"
+expect_ok "a crashed cleanup is due again" "$FLEET" cleanup-due --quiet
+o=$("$FLEET" cleanup); second=$(last_job); finish_agent "$second"
+o=$("$FLEET" clean --apply); expect_lacks "keeps the current cleaner" "$(cat "$STUB_DIR/calls.log" | tail -3)" "rm $second"
+echo 0 > "$FLEET_LOCAL_DIR/cleanup/last-start"; "$FLEET" cleanup >/dev/null; third=$(last_job); finish_agent "$third"
+: > "$STUB_DIR/calls.log"; "$FLEET" clean --apply >/dev/null
+expect_has "removes the previous cleaner" "$(cat "$STUB_DIR/calls.log")" "rm $second"
+expect_lacks "keeps the latest cleaner" "$(cat "$STUB_DIR/calls.log")" "rm $third"
+
+section "cleanup decisions, real git"
+rm -rf "$FLEET_LOCAL_DIR/tasks" "$FLEET_LOCAL_DIR/cleanup"; echo '[]' > "$STUB_DIR/agents.json"; printf -- '---\ngoal: g\npath: app\n---\n' > "$FLEET_LOCAL_DIR/repos/nohost.md"
+remote_refs() { git -C "$WORK/r.git" for-each-ref --format='%(refname) %(objectname)' | sort; }
+wt_task() { # name verdict: creates a task whose worker has a real worktree and pushed branch
+  local o wt="$WS/app/.claude/worktrees/$1" id j
+  git -C "$WS/app" worktree add -q "$wt" -b "br-$1"
+  (cd "$wt"; echo "$1" > "f-$1"; git add .; git commit -qm "$1"; git push -q origin "br-$1")
+  o=$("$FLEET" run nohost --class routine t); id=$(task_from "$o"); j=$(last_job)
+  set_agent "$j" "{state:\"done\",status:\"idle\",cwd:\"$wt\"}"
+  task_edit "$id" "$2"
+  printf '%s %s %s\n' "$id" "$j" "$wt"
+}
+task_edit() { local f="$FLEET_LOCAL_DIR/tasks/$1/task.json"; jq --arg v "$2" '.verdict=$v' "$f" > "$f.t" && mv "$f.t" "$f"; }
+before=""
+read -r t1 j1 w1 <<< "$(wt_task safe passed)"
+read -r t2 j2 w2 <<< "$(wt_task dirty passed)"; echo u > "$w2/untracked"
+read -r t3 j3 w3 <<< "$(wt_task unpushed passed)"; (cd "$w3"; echo z > z; git add z; git commit -qm z)
+read -r t4 j4 w4 <<< "$(wt_task running passed)"; set_agent "$j4" '{state:"working",status:"busy"}'
+read -r t5 j5 w5 <<< "$(wt_task undecided failed)"
+read -r t6 j6 w6 <<< "$(wt_task modified passed)"; echo more >> "$w6/f-modified"
+o=$("$FLEET" run nohost --class lookup q); t7=$(task_from "$o"); j7=$(last_job); finish_agent "$j7"; result "$t7" 1 "" skipped "$WS/app"
+before=$(remote_refs)
+: > "$STUB_DIR/calls.log"; o=$("$FLEET" clean --list)
+expect_has "--list counts them" "$o" "would remove 2"
+expect_lacks "--list removes nothing" "$(cat "$STUB_DIR/calls.log")" "rm "
+expect_ok "--list leaves the worktree" test -d "$w1"
+o=$("$FLEET" clean --apply); calls=$(cat "$STUB_DIR/calls.log")
+expect_has "removes a safe worker" "$calls" "rm $j1"
+expect_has "removes a finished lookup" "$calls" "rm $j7"
+expect_lacks "keeps untracked files" "$calls" "rm $j2"
+expect_lacks "keeps unpushed commits" "$calls" "rm $j3"
+expect_lacks "keeps an active worker" "$calls" "rm $j4"
+expect_lacks "keeps an undecided task" "$calls" "rm $j5"
+expect_lacks "keeps uncommitted changes" "$calls" "rm $j6"
+expect_has "reports untracked files" "$o" "uncommitted or untracked"
+expect_has "reports unpushed commits" "$o" "1 unpushed"
+expect_eq "LOCAL ONLY: the remote is unchanged" "$(remote_refs)" "$before"
+expect_lacks "LOCAL ONLY: never pushes" "$calls" "push"
+expect_has "status shows what's kept" "$("$FLEET" status)" "unpushed"
+echo "$(tj "$t1" '.attempts[0].cleaned')" | grep -q true && ok || bad "marks the attempt as cleaned"
+# The stub removed the row but not the folder, so check manual worktrees separately.
+git -C "$WS/app" branch --list br-safe >/dev/null
+git -C "$w5" remote set-url origin "$WORK/missing.git"; task_edit "$t5" passed; set_agent "$j5" '{state:"done",status:"idle"}'
+o=$("$FLEET" clean --apply); expect_has "unreachable remote keeps it" "$o" "couldn't reach the remote"; expect_lacks "unreachable remote: no removal" "$(tail -5 "$STUB_DIR/calls.log")" "rm $j5"
+git -C "$w5" remote set-url origin "$WORK/r.git"
+touch "$STUB_DIR/rm-fail"; read -r t8 j8 w8 <<< "$(wt_task refuses passed)"; o=$("$FLEET" clean --apply); rm "$STUB_DIR/rm-fail"
+expect_has "a refusal from claude rm is kept" "$o" "claude rm kept it"
+# A manual worktree is removed by fleet itself, with its branch.
+git -C "$WS/app" branch -q manual-br; o=$("$FLEET" run nohost --class routine --branch manual-br t); t9=$(task_from "$o"); j9=$(last_job); mw=$(tj "$t9" '.attempts[0].manual_worktree')
+(cd "$mw"; echo m > m; git add m; git commit -qm m; git push -q origin manual-br); set_agent "$j9" "{state:\"done\",status:\"idle\",cwd:\"$mw\"}"; task_edit "$t9" passed
+before=$(remote_refs); "$FLEET" clean --apply >/dev/null
+expect_eq "manual worktree is removed" "$(test -d "$mw" && echo yes || echo no)" "no"
+expect_eq "its local branch is removed" "$(git -C "$WS/app" branch --list manual-br)" ""
+expect_eq "its remote branch stays" "$(remote_refs)" "$before"
+# Superseded attempts go once a later attempt has the work.
+read -r t10 j10 w10 <<< "$(wt_task superseded failed)"; verdictfile="$FLEET_LOCAL_DIR/tasks/$t10/attempts"; result "$t10" 1 failed none "$w10"; "$FLEET" check "$t10" >/dev/null; "$FLEET" retry "$t10" >/dev/null; j11=$(last_job); finish_agent "$j11"
+: > "$STUB_DIR/calls.log"; "$FLEET" clean --apply >/dev/null; expect_has "failed earlier attempt is removed" "$(cat "$STUB_DIR/calls.log")" "rm $j10"
+# PR state decides, and a squash merge counts because the host says so.
+printf -- '---\ngoal: g\npath: app\nhost_cli: gh\n---\n' > "$FLEET_LOCAL_DIR/repos/hosted.md"
+mk_pr() { local wt="$WS/app/.claude/worktrees/$1" o id j; git -C "$WS/app" worktree add -q "$wt" -b "pr-$1"; (cd "$wt"; echo "$1" > "$1"; git add .; git commit -qm "$1"; git push -q origin "pr-$1"); o=$("$FLEET" run hosted --class routine t); id=$(task_from "$o"); j=$(last_job); set_agent "$j" "{state:\"done\",status:\"idle\",cwd:\"$wt\"}"; local f="$FLEET_LOCAL_DIR/tasks/$id/task.json"; jq '.pr_url="https://example.invalid/pr/1"|.verdict="passed"' "$f" > "$f.t" && mv "$f.t" "$f"; printf '%s %s\n' "$id" "$j"; }
+read -r t12 j12 <<< "$(mk_pr open1)"; echo OPEN > "$STUB_DIR/gh-state"; : > "$STUB_DIR/calls.log"; o=$("$FLEET" clean --apply)
+expect_lacks "open PR keeps its worker" "$(cat "$STUB_DIR/calls.log")" "rm $j12"; expect_has "open PR is noted" "$o" "PR is still open"
+echo MERGED > "$STUB_DIR/gh-state"; : > "$STUB_DIR/calls.log"; "$FLEET" clean --apply >/dev/null
+expect_has "merged PR removes its worker" "$(cat "$STUB_DIR/calls.log")" "rm $j12"
+printf -- '---\ngoal: g\npath: app\n---\n' > "$FLEET_LOCAL_DIR/repos/hosted.md"; read -r t13 j13 <<< "$(mk_pr noscli)"; : > "$STUB_DIR/calls.log"; o=$("$FLEET" clean --apply)
+expect_has "no host CLI is reported" "$o" "can't confirm the state"; expect_lacks "no host CLI: no removal" "$(cat "$STUB_DIR/calls.log")" "rm $j13"
+# Unknown sessions are left alone.
+jq '. + [{id:"unknown1",name:"mine",kind:"background",state:"done",status:"idle",cwd:"/x"}]' "$STUB_DIR/agents.json" > "$STUB_DIR/a.tmp" && mv "$STUB_DIR/a.tmp" "$STUB_DIR/agents.json"
+: > "$STUB_DIR/calls.log"; "$FLEET" clean --apply >/dev/null
+expect_lacks "unknown session is left alone" "$(cat "$STUB_DIR/calls.log")" "unknown1"
+expect_has "unknown session is reported" "$("$FLEET" status)" "unknown1"
+# Discard needs a real terminal.
+o=$("$FLEET" clean --discard "$t3" </dev/null 2>&1); rc=$?
+expect_eq "--discard refuses without a terminal" "$rc" "1"; expect_has "says why" "$o" "real terminal"
+# Old entries become a summary.
+f="$FLEET_LOCAL_DIR/tasks/$t1/task.json"; jq '.created=1 | .attempts |= map(.cleaned=true)' "$f" > "$f.t" && mv "$f.t" "$f"
+"$FLEET" clean --apply >/dev/null
+expect_eq "old entries are removed" "$(test -d "$FLEET_LOCAL_DIR/tasks/$t1" && echo yes || echo no)" "no"
+expect_has "a summary is kept" "$(cat "$FLEET_LOCAL_DIR/tasks-archive.jsonl")" "$t1"
+# Reminder after 7 days.
+f="$FLEET_LOCAL_DIR/tasks/$t13/task.json"; jq '.verdict="unverified"|.verdict_at=1' "$f" > "$f.t" && mv "$f.t" "$f"
+expect_has "7-day reminder" "$("$FLEET" status)" "over 7 days"
+
+# ---------- misc ----------
+section "reading commands"
+expect_has "repos lists goals" "$("$FLEET" repos)" "Test application"
+expect_has "show prints an entry" "$("$FLEET" show app)" "App restrictions marker"
+expect_has "envs lists everything" "$("$FLEET" envs)" "ENV-TWO-MARKER"
+expect_has "envs for a repo" "$("$FLEET" envs app)" "ENV-ONE-MARKER"
+expect_lacks "envs for a repo is limited" "$("$FLEET" envs app)" "ENV-TWO-MARKER"
+mkdir -p "$WORK/dup"; git init -q "$WS/dup1"; git -C "$WS/dup1" remote add origin same-url; git init -q "$WS/dup2"; git -C "$WS/dup2" remote add origin same-url
+ln -s "$WS/dup1" "$WS/duplink"
+o=$("$FLEET" status); expect_has "status flags duplicates" "$o" "dup1"; expect_has "status flags both" "$o" "dup2"; expect_has "status shows disk" "$o" "DISK USED"; expect_lacks "a symlink isn't a duplicate" "$o" "duplink"
+o=$("$FLEET" doctor 2>&1); rc=$?
+expect_eq "doctor fails on a repo outside the workspace" "$rc" "1"; expect_has "doctor names it" "$o" "repo lnk"
+rm -f "$FLEET_LOCAL_DIR/repos/lnk.md" "$FLEET_LOCAL_DIR/repos/out.md"
+expect_ok "doctor passes" "$FLEET" doctor
+o=$(STUB_VERSION=1.0.0 "$FLEET" doctor); expect_has "doctor warns on an old claude" "$o" "older than the tested"
+o=$(PATH="$WORK/nogit:$PATH" "$FLEET" doctor 2>&1); mkdir -p "$WORK/oldgit"; printf '#!/bin/bash\n[ "$1" = "--version" ] && echo "git version 2.20.0" && exit 0\nexec %s "$@"\n' "$(command -v git)" > "$WORK/oldgit/git"; chmod +x "$WORK/oldgit/git"
+o=$(PATH="$WORK/oldgit:$PATH" "$FLEET" doctor 2>&1); expect_has "doctor fails on old git" "$o" "too old"
+expect_fail "unknown command" "$FLEET" nonsense
+o=$(FLEET_LOCAL_DIR="$WORK/empty" "$FLEET" repos 2>&1); expect_has "unconfigured points to bootstrap" "$o" "/bootstrap"
+expect_ok "plugin manifest" jq -e .name "$HOME_DIR/worker-plugin/.claude-plugin/plugin.json"
+for f in hq cleaner setup; do grep -q "^name: $f$" "$HOME_DIR/.claude/agents/$f.md" && ok || bad "agent file $f"; done
+expect_has "git-hook links exist" "$(ls -l "$HOME_DIR/policy/git-hooks/pre-push")" "_chain"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" = 0 ]
