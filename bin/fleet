@@ -1091,7 +1091,7 @@ EOF
   local unknown
   unknown=$(printf '%s' "$all" | jq -r '.[] | select(.kind == "background") | "\(.id) \(.name // "unnamed") \(.cwd)"' | while IFS= read -r line; do
     id=${line%% *}
-    case "$id" in "") continue ;; esac
+    [ -n "$id" ] || continue
     grep -qsF "\"$id\"" "$LOCAL"/tasks/*/task.json && continue
     grep -qsxF "$id" "$LOCAL/cleanup/cleaner-jobs" && continue
     echo "  $line"
