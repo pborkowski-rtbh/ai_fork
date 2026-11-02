@@ -9,6 +9,10 @@ HOME_DIR=$(cd -P "$TESTS/.." && pwd -P)
 FLEET="$HOME_DIR/bin/fleet"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/fleet tests.XXXXXX")   # the space is deliberate
 trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
+# A failed or empty cd must never land in a real repo: start in $WORK, and stop git searching above it.
+HEAD_BEFORE=$(git -C "$HOME_DIR" rev-parse HEAD 2>/dev/null)
+cd "$WORK" || exit 1
+export GIT_CEILING_DIRECTORIES="$(pwd -P)"
 export FLEET_CLAUDE="$TESTS/stubs/claude"
 export STUB_DIR="$WORK/stub"
 export FLEET_LOCAL_DIR="$WORK/local"
@@ -129,12 +133,12 @@ mkdir hh; printf '#!/bin/bash\nexit 1\n' > hh/pre-commit; chmod +x hh/pre-commit
 echo f > f; git add f
 if o=$(push_env git commit -qm f 2>&1); then bad "repo's configured core.hooksPath should still run"; else ok; fi
 git config --local --unset core.hooksPath; git reset -q --hard; rm -rf hh
-cd "$HOME_DIR"
+cd "$WORK" || exit 1
 
 # ---------- fixture for fleet ----------
 WS="$WORK/work space"; mkdir -p "$WS"
 git init -q --bare -b main "$WORK/r.git"
-git init -q -b main "$WS/app"; (cd "$WS/app"; echo x > x; git add x; git commit -qm x; git remote add origin "$WORK/r.git"; git push -q -u origin main; git remote set-head origin main)
+git init -q -b main "$WS/app"; (cd "$WS/app" || exit 1; echo x > x; git add x; git commit -qm x; git remote add origin "$WORK/r.git"; git push -q -u origin main; git remote set-head origin main)
 mkdir -p "$WS/plain" "$WORK/outside"
 jq -n --arg w "$WS" '{workspace:$w,alert:"none",cleanup_interval_hours:2}' > "$FLEET_LOCAL_DIR/fleet.json"
 cat > "$FLEET_LOCAL_DIR/repos/app.md" <<'EOF'
@@ -400,7 +404,7 @@ id=$(new_task --class routine); j=$(last_job); finish_agent "$j"; result "$id" 1
 expect_fail "passed isn't retried" "$FLEET" retry "$id"
 # A failed attempt with commits continues from its tip on a new branch.
 id=$(new_task --class routine); j=$(last_job); finish_agent "$j"
-git -C "$WS/app" worktree add -q "$WORK/old" -b old-branch; (cd "$WORK/old"; echo n > n; git add n; git commit -qm n)
+git -C "$WS/app" worktree add -q "$WORK/old" -b old-branch; (cd "$WORK/old" || exit 1; echo n > n; git add n; git commit -qm n)
 h=$(git -C "$WORK/old" rev-parse HEAD); mkdir -p "$FLEET_LOCAL_DIR/tasks/$id/attempts"
 jq -n --arg h "$h" --arg c "$WORK/old" '{status:"failed",message:"m",pr:"",cwd:$c,branch:"old-branch",head:$h,checks_state:"skipped",checks:[],background_tasks:0,at:1}' > "$FLEET_LOCAL_DIR/tasks/$id/attempts/1.result.json"; verdict "$id" >/dev/null
 expect_ok "retry from the tip while the old worktree exists" "$FLEET" retry "$id"
@@ -430,7 +434,7 @@ expect_fail "gone session is refused" "$FLEET" continue "$id" 'again'
 # ---------- worker-stop ----------
 section "worker stop hook"
 STOP="$HOME_DIR/policy/worker-stop"; T="$WORK/stoptask"; mkdir -p "$T/attempts"
-R="$WORK/stoprepo"; git init -q -b main "$R"; (cd "$R"; echo a > a; git add a; git commit -qm a)
+R="$WORK/stoprepo"; git init -q -b main "$R"; (cd "$R" || exit 1; echo a > a; git add a; git commit -qm a)
 stop_run() { # message [background]
   jq -n --arg c "$R" --arg m "$1" --argjson b "${2:-0}" '{cwd:$c,last_assistant_message:$m,session_id:"s",background_tasks:(if $b>0 then [1] else [] end)}' \
    | FLEET_TASK_DIR="$T" FLEET_ATTEMPT=1 FLEET_ATTEMPT_KIND="${KIND:-worker}" FLEET_CHECKS_FILE="$T/checks" FLEET_CHECK_TIMEOUT="${LIMIT:-5}" "$STOP" 2>"$T/err"
@@ -495,7 +499,7 @@ remote_refs() { git -C "$WORK/r.git" for-each-ref --format='%(refname) %(objectn
 wt_task() { # name verdict: creates a task whose worker has a real worktree and pushed branch
   local o wt="$WS/app/.claude/worktrees/$1" id j
   git -C "$WS/app" worktree add -q "$wt" -b "br-$1"
-  (cd "$wt"; echo "$1" > "f-$1"; git add .; git commit -qm "$1"; git push -q origin "br-$1")
+  (cd "$wt" || exit 1; echo "$1" > "f-$1"; git add .; git commit -qm "$1"; git push -q origin "br-$1")
   o=$("$FLEET" run nohost --class routine t); id=$(task_from "$o"); j=$(last_job)
   set_agent "$j" "{state:\"done\",status:\"idle\",cwd:\"$wt\"}"
   task_edit "$id" "$2"
@@ -505,7 +509,7 @@ task_edit() { local f="$FLEET_LOCAL_DIR/tasks/$1/task.json"; jq --arg v "$2" '.v
 before=""
 read -r t1 j1 w1 <<< "$(wt_task safe passed)"
 read -r t2 j2 w2 <<< "$(wt_task dirty passed)"; echo u > "$w2/untracked"
-read -r t3 j3 w3 <<< "$(wt_task unpushed passed)"; (cd "$w3"; echo z > z; git add z; git commit -qm z)
+read -r t3 j3 w3 <<< "$(wt_task unpushed passed)"; (cd "$w3" || exit 1; echo z > z; git add z; git commit -qm z)
 read -r t4 j4 w4 <<< "$(wt_task running passed)"; set_agent "$j4" '{state:"working",status:"busy"}'
 read -r t5 j5 w5 <<< "$(wt_task undecided failed)"
 read -r t6 j6 w6 <<< "$(wt_task modified passed)"; echo more >> "$w6/f-modified"
@@ -538,7 +542,7 @@ touch "$STUB_DIR/rm-fail"; read -r t8 j8 w8 <<< "$(wt_task refuses passed)"; o=$
 expect_has "a refusal from claude rm is kept" "$o" "claude rm kept it"
 # A manual worktree is removed by fleet itself, with its branch.
 git -C "$WS/app" branch -q manual-br; o=$("$FLEET" run nohost --class routine --branch manual-br t); t9=$(task_from "$o"); j9=$(last_job); mw=$(tj "$t9" '.attempts[0].manual_worktree')
-(cd "$mw"; echo m > m; git add m; git commit -qm m; git push -q origin manual-br); set_agent "$j9" "{state:\"done\",status:\"idle\",cwd:\"$mw\"}"; task_edit "$t9" passed
+(cd "$mw" || exit 1; echo m > m; git add m; git commit -qm m; git push -q origin manual-br); set_agent "$j9" "{state:\"done\",status:\"idle\",cwd:\"$mw\"}"; task_edit "$t9" passed
 before=$(remote_refs); "$FLEET" clean --apply >/dev/null
 expect_eq "manual worktree is removed" "$(test -d "$mw" && echo yes || echo no)" "no"
 expect_eq "its local branch is removed" "$(git -C "$WS/app" branch --list manual-br)" ""
@@ -548,7 +552,7 @@ read -r t10 j10 w10 <<< "$(wt_task superseded failed)"; verdictfile="$FLEET_LOCA
 : > "$STUB_DIR/calls.log"; "$FLEET" clean --apply >/dev/null; expect_has "failed earlier attempt is removed" "$(cat "$STUB_DIR/calls.log")" "rm $j10"
 # PR state decides, and a squash merge counts because the host says so.
 printf -- '---\ngoal: g\npath: app\nhost_cli: gh\n---\n' > "$FLEET_LOCAL_DIR/repos/hosted.md"
-mk_pr() { local wt="$WS/app/.claude/worktrees/$1" o id j; git -C "$WS/app" worktree add -q "$wt" -b "pr-$1"; (cd "$wt"; echo "$1" > "$1"; git add .; git commit -qm "$1"; git push -q origin "pr-$1"); o=$("$FLEET" run hosted --class routine t); id=$(task_from "$o"); j=$(last_job); set_agent "$j" "{state:\"done\",status:\"idle\",cwd:\"$wt\"}"; local f="$FLEET_LOCAL_DIR/tasks/$id/task.json"; jq '.pr_url="https://example.invalid/pr/1"|.verdict="passed"' "$f" > "$f.t" && mv "$f.t" "$f"; printf '%s %s\n' "$id" "$j"; }
+mk_pr() { local wt="$WS/app/.claude/worktrees/$1" o id j; git -C "$WS/app" worktree add -q "$wt" -b "pr-$1"; (cd "$wt" || exit 1; echo "$1" > "$1"; git add .; git commit -qm "$1"; git push -q origin "pr-$1"); o=$("$FLEET" run hosted --class routine t); id=$(task_from "$o"); j=$(last_job); set_agent "$j" "{state:\"done\",status:\"idle\",cwd:\"$wt\"}"; local f="$FLEET_LOCAL_DIR/tasks/$id/task.json"; jq '.pr_url="https://example.invalid/pr/1"|.verdict="passed"' "$f" > "$f.t" && mv "$f.t" "$f"; printf '%s %s\n' "$id" "$j"; }
 read -r t12 j12 <<< "$(mk_pr open1)"; echo OPEN > "$STUB_DIR/gh-state"; : > "$STUB_DIR/calls.log"; o=$("$FLEET" clean --apply)
 expect_lacks "open PR keeps its worker" "$(cat "$STUB_DIR/calls.log")" "rm $j12"; expect_has "open PR is noted" "$o" "PR is still open"
 echo MERGED > "$STUB_DIR/gh-state"; : > "$STUB_DIR/calls.log"; "$FLEET" clean --apply >/dev/null
@@ -594,6 +598,8 @@ o=$(FLEET_LOCAL_DIR="$WORK/empty" "$FLEET" repos 2>&1); expect_has "unconfigured
 expect_ok "plugin manifest" jq -e .name "$HOME_DIR/worker-plugin/.claude-plugin/plugin.json"
 for f in hq cleaner setup; do grep -q "^name: $f$" "$HOME_DIR/.claude/agents/$f.md" && ok || bad "agent file $f"; done
 expect_has "git-hook links exist" "$(ls -l "$HOME_DIR/policy/git-hooks/pre-push")" "_chain"
+
+expect_eq "the real repo wasn't committed to" "$(git -C "$HOME_DIR" rev-parse HEAD 2>/dev/null)" "$HEAD_BEFORE"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
